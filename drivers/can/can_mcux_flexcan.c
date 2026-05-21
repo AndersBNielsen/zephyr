@@ -125,6 +125,10 @@ struct mcux_flexcan_data {
 	struct mcux_flexcan_tx_callback *tx_cbs;
 	uint32_t *rx_fifo_filter_table;
 	int *rx_fifo_alloc_map;
+	/*
+	 * Legacy RX FIFO is used for exact-match classic CAN filters because the
+	 * mailbox path can miss back-to-back frames on this target.
+	 */
 	flexcan_fifo_transfer_t rx_fifo_xfer;
 	flexcan_frame_t rx_fifo_frame;
 	bool rx_fifo_enabled;
@@ -146,6 +150,10 @@ static status_t mcux_flexcan_rx_fifo_arm(const struct device *dev)
 	struct mcux_flexcan_data *data = dev->data;
 	CAN_Type *base = get_base(dev);
 
+	/*
+	 * Let the MCUX HAL own FIFO IRQ state for a single frame at a time, then
+	 * re-arm from the transfer callback after the frame has been dispatched.
+	 */
 	data->rx_fifo_xfer.frame = &data->rx_fifo_frame;
 	data->rx_fifo_xfer.frameNum = 1U;
 
@@ -704,6 +712,11 @@ static void mcux_flexcan_can_filter_to_mbconfig(const struct can_filter *src,
 
 static bool mcux_flexcan_filter_is_rx_fifo_compatible(const struct can_filter *filter)
 {
+	/*
+	 * The legacy FIFO fix is intentionally narrow: only exact-match classic
+	 * standard-ID filters use it. Extended IDs, masked filters, and FD traffic
+	 * stay on the mailbox path where the existing semantics still apply.
+	 */
 	return filter->flags == 0U && filter->mask == CAN_STD_ID_MASK;
 }
 
@@ -720,6 +733,11 @@ static bool mcux_flexcan_use_rx_fifo(const struct device *dev)
 	}
 #endif /* CONFIG_CAN_MCUX_FLEXCAN_FD */
 
+	/*
+	 * FIFO mode is only selected when every active RX filter can be represented
+	 * by the classic standard-ID FIFO table. Any incompatible filter forces the
+	 * driver back to per-filter mailboxes so mixed configurations keep working.
+	 */
 	for (alloc = RX_START_IDX; alloc < config->rx_mb; alloc++) {
 		if (!atomic_test_bit(data->rx_allocs, alloc)) {
 			continue;
@@ -775,12 +793,17 @@ static status_t mcux_flexcan_rx_fifo_start(const struct device *dev)
 	mask = FLEXCAN_RX_FIFO_STD_MASK_TYPE_A(CAN_STD_ID_MASK, !IS_ENABLED(CONFIG_CAN_ACCEPT_RTR),
 					       1U);
 
+	/*
+	 * Classic standard-ID exact filters are packed into the legacy FIFO so the
+	 * controller can absorb zero-gap bursts before Zephyr callback handling runs.
+	 */
 	FLEXCAN_EnterFreezeMode(base);
 	FLEXCAN_SetRxFifoGlobalMask(base, mask);
 	FLEXCAN_SetRxFifoConfig(base, &fifo_config, true);
 	FLEXCAN_ExitFreezeMode(base);
 
 	data->rx_fifo_enabled = true;
+	/* Start the first one-frame FIFO receive immediately after enabling FIFO mode. */
 	status = mcux_flexcan_rx_fifo_arm(dev);
 	if (status != kStatus_Success) {
 		data->rx_fifo_enabled = false;
@@ -815,6 +838,11 @@ static status_t mcux_flexcan_rx_path_reconfigure(const struct device *dev)
 	status_t status;
 	int alloc;
 
+	/*
+	 * Rebuild the entire RX programming whenever filters change or start/stop
+	 * transitions occur. That keeps mailbox and FIFO state mutually exclusive
+	 * and avoids stale receive state surviving across mode changes.
+	 */
 	if (data->rx_fifo_enabled) {
 		mcux_flexcan_rx_fifo_stop(dev);
 	}
@@ -830,9 +858,11 @@ static status_t mcux_flexcan_rx_path_reconfigure(const struct device *dev)
 	}
 
 	if (mcux_flexcan_use_rx_fifo(dev)) {
+		/* Exact-match classic filters are rebuilt as a shared FIFO receive path. */
 		return mcux_flexcan_rx_fifo_start(dev);
 	}
 
+	/* Otherwise fall back to the original one-filter-per-mailbox programming. */
 	for (alloc = RX_START_IDX; alloc < config->rx_mb; alloc++) {
 		if (!atomic_test_bit(data->rx_allocs, alloc)) {
 			continue;
@@ -1021,6 +1051,11 @@ static int mcux_flexcan_add_rx_filter(const struct device *dev,
 	data->rx_cbs[alloc].arg = user_data;
 	data->rx_cbs[alloc].function = callback;
 
+	/*
+	 * Keep the mailbox metadata populated even for FIFO-compatible filters so a
+	 * later path reconfigure can move between FIFO and mailbox operation without
+	 * rebuilding filter state from scratch.
+	 */
 	/* The indidual RX mask registers can only be written in freeze mode */
 	FLEXCAN_EnterFreezeMode(base);
 	base->RXIMR[ALLOC_IDX_TO_RXMB_IDX(alloc)] = mask;
@@ -1255,6 +1290,11 @@ static inline void mcux_flexcan_transfer_rx_idle(const struct device *dev,
 			LOG_ERR("Failed to restart rx for filter id %d (err = %d)", alloc, status);
 		}
 
+		/*
+		 * Mailbox receives are snapshotted in the callback and dispatched later so
+		 * shell printing and user callbacks do not run directly out of the HAL IRQ
+		 * callback path.
+		 */
 		if (snapshot->status == kStatus_Fail) {
 			return;
 		}
@@ -1294,6 +1334,10 @@ static inline void mcux_flexcan_transfer_rx_fifo_frame(const struct device *dev,
 		return;
 	}
 
+	/*
+	 * FIFO receives already arrive as completed frames, so they can be delivered
+	 * directly and then the HAL-managed one-frame FIFO receive is re-armed.
+	 */
 	function = data->rx_cbs[alloc].function;
 	arg = data->rx_cbs[alloc].arg;
 	mcux_flexcan_to_can_frame(src, &frame);
@@ -1308,6 +1352,7 @@ static void mcux_flexcan_process_rx_batch(const struct device *dev)
 
 	for (alloc = RX_START_IDX; alloc < config->rx_mb; alloc++) {
 		if (atomic_test_and_clear_bit(data->rx_pending, alloc)) {
+			/* Drain the mailbox snapshots that were deferred out of the IRQ callback. */
 			mcux_flexcan_transfer_rx_idle(dev, ALLOC_IDX_TO_RXMB_IDX(alloc));
 		}
 	}
@@ -1357,6 +1402,7 @@ static FLEXCAN_CALLBACK(mcux_flexcan_transfer_callback)
 	case kStatus_FLEXCAN_RxFifoIdle:
 		mcux_flexcan_transfer_rx_fifo_frame(data->dev, &data->rx_fifo_frame);
 		if (data->common.started && data->rx_fifo_enabled) {
+			/* Re-arm after dispatch so burst traffic never depends on a manual FIFO ISR loop. */
 			status_t fifo_status = mcux_flexcan_rx_fifo_arm(data->dev);
 
 			if (fifo_status != kStatus_Success) {
@@ -1406,6 +1452,7 @@ static void mcux_flexcan_isr(const struct device *dev)
 	ARG_UNUSED(fifo_flags);
 
 	if (data->rx_fifo_enabled) {
+		/* In FIFO mode the HAL handles FIFO status/ack sequencing for us. */
 		FLEXCAN_TransferHandleIRQ(base, &data->handle);
 	} else {
 		FLEXCAN_BusoffErrorHandleIRQ(base, &data->handle);
