@@ -25,6 +25,8 @@
 
 LOG_MODULE_REGISTER(can_mcux_flexcan, CONFIG_CAN_LOG_LEVEL);
 
+#define MCUX_FLEXCAN_RX_FIFO_BATCH_SIZE 2U
+
 #if ((defined(FSL_FEATURE_FLEXCAN_HAS_ERRATA_5641) && FSL_FEATURE_FLEXCAN_HAS_ERRATA_5641) || \
 	(defined(FSL_FEATURE_FLEXCAN_HAS_ERRATA_5829) && FSL_FEATURE_FLEXCAN_HAS_ERRATA_5829))
 /* the first valid MB should be occupied by ERRATA 5461 or 5829. */
@@ -130,7 +132,8 @@ struct mcux_flexcan_data {
 	 * mailbox path can miss back-to-back frames on this target.
 	 */
 	flexcan_fifo_transfer_t rx_fifo_xfer;
-	flexcan_frame_t rx_fifo_frame;
+	flexcan_frame_t rx_fifo_frames[MCUX_FLEXCAN_RX_FIFO_BATCH_SIZE];
+	size_t rx_fifo_dispatched;
 	bool rx_fifo_enabled;
 
 	struct k_mutex rx_mutex;
@@ -151,11 +154,12 @@ static status_t mcux_flexcan_rx_fifo_arm(const struct device *dev)
 	CAN_Type *base = get_base(dev);
 
 	/*
-	 * Let the MCUX HAL own FIFO IRQ state for a single frame at a time, then
-	 * re-arm from the transfer callback after the frame has been dispatched.
+	 * Keep a small batch armed so back-to-back frames can be drained without
+	 * depending on an immediate userspace re-arm between fragments.
 	 */
-	data->rx_fifo_xfer.frame = &data->rx_fifo_frame;
-	data->rx_fifo_xfer.frameNum = 1U;
+	data->rx_fifo_dispatched = 0U;
+	data->rx_fifo_xfer.frame = data->rx_fifo_frames;
+	data->rx_fifo_xfer.frameNum = MCUX_FLEXCAN_RX_FIFO_BATCH_SIZE;
 
 	return FLEXCAN_TransferReceiveFifoNonBlocking(base, &data->handle,
 						      &data->rx_fifo_xfer);
@@ -340,6 +344,7 @@ static int mcux_flexcan_start(const struct device *dev)
 
 	/* Reset statistics and clear error counters */
 	CAN_STATS_RESET(dev);
+	FLEXCAN_EnterFreezeMode(base);
 	base->ECR &= ~(CAN_ECR_TXERRCNT_MASK | CAN_ECR_RXERRCNT_MASK);
 
 	/* Delay this until start since setting the timing automatically exits freeze mode */
@@ -712,12 +717,7 @@ static void mcux_flexcan_can_filter_to_mbconfig(const struct can_filter *src,
 
 static bool mcux_flexcan_filter_is_rx_fifo_compatible(const struct can_filter *filter)
 {
-	/*
-	 * The legacy FIFO fix is intentionally narrow: only exact-match classic
-	 * standard-ID filters use it. Extended IDs, masked filters, and FD traffic
-	 * stay on the mailbox path where the existing semantics still apply.
-	 */
-	return filter->flags == 0U && filter->mask == CAN_STD_ID_MASK;
+	return (filter->flags & ~(CAN_FILTER_IDE)) == 0U;
 }
 
 static bool mcux_flexcan_use_rx_fifo(const struct device *dev)
@@ -760,18 +760,35 @@ static status_t mcux_flexcan_rx_fifo_start(const struct device *dev)
 	CAN_Type *base = get_base(dev);
 	flexcan_rx_fifo_config_t fifo_config;
 	status_t status;
-	uint32_t mask;
+	uint32_t mask = 0x3FFFFFFFU;
 	int filter_count = 0;
+	int fifo_filter_count;
 	int alloc;
+	uint32_t entry_mask;
 
 	for (alloc = RX_START_IDX; alloc < config->rx_mb; alloc++) {
 		if (!atomic_test_bit(data->rx_allocs, alloc)) {
 			continue;
 		}
 
-		data->rx_fifo_filter_table[filter_count] =
-			FLEXCAN_RX_FIFO_STD_FILTER_TYPE_A(data->rx_cbs[alloc].filter.id, 0U, 0U);
+		if ((data->rx_cbs[alloc].filter.flags & CAN_FILTER_IDE) != 0U) {
+			data->rx_fifo_filter_table[filter_count] =
+				FLEXCAN_RX_FIFO_EXT_FILTER_TYPE_A(data->rx_cbs[alloc].filter.id, 0U, 1U);
+			entry_mask = FLEXCAN_RX_FIFO_EXT_MASK_TYPE_A(data->rx_cbs[alloc].filter.mask,
+							     !IS_ENABLED(CONFIG_CAN_ACCEPT_RTR), 1U);
+		} else {
+			data->rx_fifo_filter_table[filter_count] =
+				FLEXCAN_RX_FIFO_STD_FILTER_TYPE_A(data->rx_cbs[alloc].filter.id, 0U, 0U);
+			entry_mask = FLEXCAN_RX_FIFO_STD_MASK_TYPE_A(data->rx_cbs[alloc].filter.mask,
+							     !IS_ENABLED(CONFIG_CAN_ACCEPT_RTR), 1U);
+		}
+
+		if (filter_count == 0) {
+			mask = entry_mask;
+		}
+
 		data->rx_fifo_alloc_map[filter_count] = alloc;
+		data->rx_fifo_filter_table[filter_count] = data->rx_fifo_filter_table[filter_count];
 		filter_count++;
 	}
 
@@ -780,24 +797,41 @@ static status_t mcux_flexcan_rx_fifo_start(const struct device *dev)
 		return kStatus_Success;
 	}
 
+	fifo_filter_count = filter_count;
+
 	for (; filter_count < config->max_filters; filter_count++) {
 		data->rx_fifo_filter_table[filter_count] = 0xFFFFFFFFU;
 		data->rx_fifo_alloc_map[filter_count] = -1;
 	}
 
 	fifo_config.idFilterTable = data->rx_fifo_filter_table;
-	fifo_config.idFilterNum = config->max_filters;
+	fifo_config.idFilterNum = fifo_filter_count;
 	fifo_config.idFilterType = kFLEXCAN_RxFifoFilterTypeA;
 	fifo_config.priority = kFLEXCAN_RxFifoPrioHigh;
 
-	mask = FLEXCAN_RX_FIFO_STD_MASK_TYPE_A(CAN_STD_ID_MASK, !IS_ENABLED(CONFIG_CAN_ACCEPT_RTR),
-					       1U);
-
 	/*
-	 * Classic standard-ID exact filters are packed into the legacy FIFO so the
-	 * controller can absorb zero-gap bursts before Zephyr callback handling runs.
+	 * With individual masking enabled, the Legacy FIFO can use one RXIMR entry
+	 * per filter table element. That lets standard and extended classic filters
+	 * coexist on the FIFO path instead of falling back to mailbox receives.
 	 */
 	FLEXCAN_EnterFreezeMode(base);
+	for (alloc = RX_START_IDX, filter_count = 0; alloc < config->rx_mb; alloc++) {
+		if (!atomic_test_bit(data->rx_allocs, alloc)) {
+			continue;
+		}
+
+		if ((data->rx_cbs[alloc].filter.flags & CAN_FILTER_IDE) != 0U) {
+			base->RXIMR[filter_count] = FLEXCAN_RX_FIFO_EXT_MASK_TYPE_A(
+				data->rx_cbs[alloc].filter.mask,
+				!IS_ENABLED(CONFIG_CAN_ACCEPT_RTR), 1U);
+		} else {
+			base->RXIMR[filter_count] = FLEXCAN_RX_FIFO_STD_MASK_TYPE_A(
+				data->rx_cbs[alloc].filter.mask,
+				!IS_ENABLED(CONFIG_CAN_ACCEPT_RTR), 1U);
+		}
+
+		filter_count++;
+	}
 	FLEXCAN_SetRxFifoGlobalMask(base, mask);
 	FLEXCAN_SetRxFifoConfig(base, &fifo_config, true);
 	FLEXCAN_ExitFreezeMode(base);
@@ -858,7 +892,6 @@ static status_t mcux_flexcan_rx_path_reconfigure(const struct device *dev)
 	}
 
 	if (mcux_flexcan_use_rx_fifo(dev)) {
-		/* Exact-match classic filters are rebuilt as a shared FIFO receive path. */
 		return mcux_flexcan_rx_fifo_start(dev);
 	}
 
@@ -1275,7 +1308,6 @@ static inline void mcux_flexcan_transfer_rx_idle(const struct device *dev,
 	can_rx_callback_t function;
 	struct can_frame frame;
 	struct mcux_flexcan_rx_snapshot *snapshot;
-	status_t status = kStatus_Fail;
 	void *arg;
 	int alloc;
 
@@ -1285,11 +1317,6 @@ static inline void mcux_flexcan_transfer_rx_idle(const struct device *dev,
 	snapshot = &data->rx_snapshots[alloc];
 
 	if (atomic_test_bit(data->rx_allocs, alloc)) {
-		status = mcux_flexcan_mb_enable(dev, alloc);
-		if (status != kStatus_Success) {
-			LOG_ERR("Failed to restart rx for filter id %d (err = %d)", alloc, status);
-		}
-
 		/*
 		 * Mailbox receives are snapshotted in the callback and dispatched later so
 		 * shell printing and user callbacks do not run directly out of the HAL IRQ
@@ -1322,6 +1349,10 @@ static inline void mcux_flexcan_transfer_rx_fifo_frame(const struct device *dev,
 	void *arg;
 	int alloc;
 
+	/*
+	 * FIFO receives already arrive as completed frames, so they can be delivered
+	 * directly and then the HAL-managed one-frame FIFO receive is re-armed.
+	 */
 	fifo_hit = src->idhit;
 	if (fifo_hit >= DEV_CFG(dev)->max_filters) {
 		LOG_WRN("RX FIFO hit index %u out of bounds", fifo_hit);
@@ -1334,14 +1365,61 @@ static inline void mcux_flexcan_transfer_rx_fifo_frame(const struct device *dev,
 		return;
 	}
 
-	/*
-	 * FIFO receives already arrive as completed frames, so they can be delivered
-	 * directly and then the HAL-managed one-frame FIFO receive is re-armed.
-	 */
 	function = data->rx_cbs[alloc].function;
 	arg = data->rx_cbs[alloc].arg;
 	mcux_flexcan_to_can_frame(src, &frame);
 	function(dev, &frame, arg);
+}
+
+static void mcux_flexcan_transfer_rx_fifo_dispatch_count(const struct device *dev,
+					       size_t count)
+{
+	struct mcux_flexcan_data *data = dev->data;
+	size_t idx;
+
+	count = MIN(count, ARRAY_SIZE(data->rx_fifo_frames));
+
+	for (idx = data->rx_fifo_dispatched; idx < count; idx++) {
+		mcux_flexcan_transfer_rx_fifo_frame(dev, &data->rx_fifo_frames[idx]);
+	}
+
+	data->rx_fifo_dispatched = count;
+}
+
+static void mcux_flexcan_transfer_rx_fifo_dispatch(const struct device *dev)
+{
+	struct mcux_flexcan_data *data = dev->data;
+	CAN_Type *base = get_base(dev);
+	size_t count = 0U;
+	int err;
+
+	err = FLEXCAN_TransferGetReceiveFifoCount(base, &data->handle, &count);
+	if (err != kStatus_Success) {
+		return;
+	}
+
+	mcux_flexcan_transfer_rx_fifo_dispatch_count(dev, count);
+}
+
+static bool mcux_flexcan_transfer_rx_fifo_drain(const struct device *dev)
+{
+	struct mcux_flexcan_data *data = dev->data;
+	CAN_Type *base = get_base(dev);
+	status_t status;
+
+	while (data->handle.rxFifoFrameNum > 0U &&
+	       (base->IFLAG1 & (uint32_t)kFLEXCAN_RxFifoFrameAvlFlag) != 0U) {
+		status = FLEXCAN_ReadRxFifo(base, data->handle.rxFifoFrameBuf);
+		if (status != kStatus_Success) {
+			break;
+		}
+
+		data->handle.rxFifoFrameBuf++;
+		data->handle.rxFifoFrameNum--;
+		FLEXCAN_ClearMbStatusFlags(base, (uint64_t)kFLEXCAN_RxFifoFrameAvlFlag);
+	}
+
+	return data->handle.rxFifoFrameNum == 0U;
 }
 
 static void mcux_flexcan_process_rx_batch(const struct device *dev)
@@ -1399,8 +1477,26 @@ static FLEXCAN_CALLBACK(mcux_flexcan_transfer_callback)
 	case kStatus_FLEXCAN_RxFifoOverflow:
 		CAN_STATS_RX_OVERRUN_INC(data->dev);
 		break;
+	case kStatus_FLEXCAN_RxFifoBusy:
+		if (mcux_flexcan_transfer_rx_fifo_drain(data->dev)) {
+			mcux_flexcan_transfer_rx_fifo_dispatch_count(data->dev,
+							    data->rx_fifo_xfer.frameNum);
+			FLEXCAN_TransferAbortReceiveFifo(base, &data->handle);
+			if (data->common.started && data->rx_fifo_enabled) {
+				status_t fifo_status = mcux_flexcan_rx_fifo_arm(data->dev);
+
+				if (fifo_status != kStatus_Success) {
+					LOG_ERR("failed to re-arm Rx FIFO, status %d", fifo_status);
+				}
+			}
+			break;
+		}
+		mcux_flexcan_transfer_rx_fifo_dispatch(data->dev);
+		break;
 	case kStatus_FLEXCAN_RxFifoIdle:
-		mcux_flexcan_transfer_rx_fifo_frame(data->dev, &data->rx_fifo_frame);
+		mcux_flexcan_transfer_rx_fifo_drain(data->dev);
+		mcux_flexcan_transfer_rx_fifo_dispatch_count(data->dev,
+						    data->rx_fifo_xfer.frameNum);
 		if (data->common.started && data->rx_fifo_enabled) {
 			/* Re-arm after dispatch so burst traffic never depends on a manual FIFO ISR loop. */
 			status_t fifo_status = mcux_flexcan_rx_fifo_arm(data->dev);
@@ -1427,6 +1523,10 @@ static FLEXCAN_CALLBACK(mcux_flexcan_transfer_callback)
 #ifdef CONFIG_CAN_MCUX_FLEXCAN_FD
 			}
 #endif /* CONFIG_CAN_MCUX_FLEXCAN_FD */
+			status = mcux_flexcan_mb_enable(data->dev, mb);
+			if (status != kStatus_Success) {
+				LOG_ERR("Failed to restart rx for filter id %d (err = %d)", mb, status);
+			}
 			atomic_set_bit(data->rx_pending, mb);
 		}
 		break;
@@ -1435,6 +1535,9 @@ static FLEXCAN_CALLBACK(mcux_flexcan_transfer_callback)
 		 * Unhandled status during Message Buffer processing.
 		 * If result field is 0xFF, it means no message buffer interrupt occurred.
 		 */
+		if (status_flags == 0xFFU) {
+			break;
+		}
 		__fallthrough;
 	default:
 		LOG_WRN("Unhandled status 0x%08x (result = 0x%016llx)",
@@ -1456,7 +1559,7 @@ static void mcux_flexcan_isr(const struct device *dev)
 		FLEXCAN_TransferHandleIRQ(base, &data->handle);
 	} else {
 		FLEXCAN_BusoffErrorHandleIRQ(base, &data->handle);
-		FLEXCAN_MbHandleIRQ(base, &data->handle, 0U, config->number_of_mb);
+		FLEXCAN_MbHandleIRQ(base, &data->handle, 0U, config->number_of_mb - 1U);
 	}
 
 	mcux_flexcan_process_rx_batch(dev);
